@@ -1,15 +1,31 @@
 
 import threading
 import time
+from pathlib import Path
 
 import cv2
 from fastapi import FastAPI
 from fastapi.responses import Response
 from ultralytics import YOLO
 
-app = FastAPI(title="Person Detector")
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
 
-model = YOLO("yolo11n.pt")
+app = FastAPI(title="Smart Gate and Uniform Monitoring System")
+
+MODEL_PATH = Path(__file__).resolve().parent / "best.pt"
+
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(
+        f"Trained model not found: {MODEL_PATH}"
+    )
+
+# Load YOUR trained uniform model, not yolo11n.pt
+model = YOLO(str(MODEL_PATH))
+
+print("Loaded model:", MODEL_PATH)
+print("Model classes:", model.names)
 
 lock = threading.Lock()
 
@@ -19,6 +35,10 @@ latest_people = []
 camera_error = None
 running = True
 
+
+# --------------------------------------------------
+# CAMERA AND UNIFORM DETECTION
+# --------------------------------------------------
 
 def camera_worker():
     global latest_frame, latest_count, latest_people
@@ -33,11 +53,13 @@ def camera_worker():
 
     if not camera.isOpened():
         camera.release()
+
         with lock:
             camera_error = (
                 "Cannot open webcam. Check camera permissions "
                 "and ensure another app is not using it."
             )
+
         return
 
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -59,19 +81,18 @@ def camera_worker():
 
             now = time.time()
 
-            # Run YOLO every 0.5 seconds, not on every frame.
+            # Run uniform detection every 0.5 seconds.
             if now - last_detection >= 0.5:
                 try:
                     result = model.predict(
-                        frame,
-                        classes=[0],
-                        conf=0.4,
+                        source=frame,
+                        conf=0.25,
                         imgsz=640,
                         verbose=False,
                     )[0]
 
                     new_boxes = []
-                    people = []
+                    detections = []
 
                     if result.boxes is not None:
                         for box in result.boxes:
@@ -79,22 +100,37 @@ def camera_worker():
                                 int(v)
                                 for v in box.xyxy[0].tolist()
                             ]
+
+                            class_id = int(box.cls[0])
                             confidence = float(box.conf[0])
 
+                            class_name = result.names[class_id]
+
+                            # Green for Valid; red for Invalid.
+                            if class_name.lower() == "valid":
+                                color = (0, 200, 0)
+                            else:
+                                color = (0, 0, 255)
+
                             new_boxes.append(
-                                (x1, y1, x2, y2, confidence)
+                                (
+                                    x1, y1, x2, y2,
+                                    confidence, class_name, color
+                                )
                             )
 
-                            people.append({
+                            detections.append({
                                 "box": [x1, y1, x2, y2],
+                                "class_id": class_id,
+                                "class_name": class_name,
                                 "confidence": round(confidence, 3),
                             })
 
                     cached_boxes = new_boxes
 
                     with lock:
-                        latest_count = len(people)
-                        latest_people = people
+                        latest_count = len(detections)
+                        latest_people = detections
                         camera_error = None
 
                     last_detection = now
@@ -103,20 +139,26 @@ def camera_worker():
                     with lock:
                         camera_error = f"Detection error: {exc}"
 
-            # Draw the latest detections on EVERY fresh camera frame.
-            # This prevents boxes from appearing only twice per second.
+                    print("Detection error:", exc)
+                    time.sleep(0.1)
+
+            # Draw detections on every camera frame.
             display_frame = frame.copy()
 
-            for x1, y1, x2, y2, confidence in cached_boxes:
+            for (
+                x1, y1, x2, y2,
+                confidence, class_name, color
+            ) in cached_boxes:
+
                 cv2.rectangle(
                     display_frame,
                     (x1, y1),
                     (x2, y2),
-                    (0, 0, 255),
+                    color,
                     2,
                 )
 
-                label = f"INVALID {confidence:.2f}"
+                label = f"{class_name.upper()} {confidence:.2f}"
 
                 cv2.putText(
                     display_frame,
@@ -124,7 +166,7 @@ def camera_worker():
                     (x1, max(y1 - 10, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
-                    (0, 0, 255),
+                    color,
                     2,
                 )
 
@@ -142,6 +184,10 @@ def camera_worker():
         camera.release()
         print("Webcam stopped.")
 
+
+# --------------------------------------------------
+# STARTUP AND SHUTDOWN
+# --------------------------------------------------
 
 @app.on_event("startup")
 def start_camera():
@@ -162,11 +208,16 @@ def stop_camera():
     running = False
 
 
+# --------------------------------------------------
+# API ENDPOINTS
+# --------------------------------------------------
+
 @app.get("/")
 def home():
     return {
-        "message": "Person Detector is running",
-        "camera": "Check /status",
+        "message": "Smart Gate and Uniform Monitoring System is running",
+        "model_classes": model.names,
+        "endpoints": ["/status", "/frame"],
     }
 
 
@@ -176,6 +227,7 @@ def status():
         return {
             "count": latest_count,
             "people": latest_people,
+            "detections": latest_people,
             "camera_error": camera_error,
             "ready": latest_frame is not None,
         }
