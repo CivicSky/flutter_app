@@ -1,0 +1,7 @@
+# Build artifacts
+**/build/
+.dart_tool/
+__pycache__/
+*.pyc
+.gradle/
+local.properties
