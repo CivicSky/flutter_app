@@ -1,3 +1,4 @@
+
 import os
 import threading
 import time
@@ -18,10 +19,15 @@ app = FastAPI(title="Smart Gate and Uniform Monitoring System")
 
 MODEL_PATH = Path(__file__).resolve().parent / "best.pt"
 
-if not MODEL_PATH.exists():
-    raise FileNotFoundError(f"Trained model not found: {MODEL_PATH}")
+CONFIDENCE_THRESHOLD = 0.20
+IMAGE_SIZE = 640
 
-# Load trained uniform model
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(
+        f"Trained model not found: {MODEL_PATH}"
+    )
+
+# Load custom trained YOLO model
 model = YOLO(str(MODEL_PATH))
 
 print("Loaded model:", MODEL_PATH)
@@ -32,7 +38,7 @@ frame_lock = threading.Lock()
 raw_lock = threading.Lock()
 detection_lock = threading.Lock()
 
-# Video & Detection State
+# Video and detection state
 latest_raw_frame = None
 latest_frame = None
 cached_boxes = []
@@ -43,134 +49,285 @@ running = True
 
 
 # --------------------------------------------------
-# DETECTION WORKER (ASYNC & HIGH PERFORMANCE)
+# DETECTION WORKER
 # --------------------------------------------------
 
 def detection_worker():
-    global cached_boxes, latest_people, latest_count, camera_error
+    global cached_boxes
+    global latest_people
+    global latest_count
+    global camera_error
 
     print("YOLO detection worker started.")
 
     while running:
+
         with raw_lock:
-            frame_to_detect = None if latest_raw_frame is None else latest_raw_frame.copy()
+            frame_to_detect = (
+                None
+                if latest_raw_frame is None
+                else latest_raw_frame.copy()
+            )
 
         if frame_to_detect is None:
             time.sleep(0.02)
             continue
 
         try:
-            # imgsz=480 delivers ~40ms inference on CPU (20x faster than 640 with equal accuracy)
             with torch.inference_mode():
+
                 results = model.predict(
                     source=frame_to_detect,
-                    conf=0.25,
-                    imgsz=480,
+                    conf=CONFIDENCE_THRESHOLD,
+                    imgsz=IMAGE_SIZE,
                     verbose=False,
                 )
+
             result = results[0]
 
             new_boxes = []
             detections = []
 
             if result.boxes is not None:
+
                 for box in result.boxes:
-                    x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+
+                    # Bounding box coordinates
+                    x1, y1, x2, y2 = [
+                        int(v)
+                        for v in box.xyxy[0].tolist()
+                    ]
+
+                    # Class and confidence
                     class_id = int(box.cls[0])
                     confidence = float(box.conf[0])
+
                     class_name = result.names[class_id]
+                    class_name = str(class_name).strip().lower()
 
-                    is_valid = class_name.lower() == "valid"
-                    color = (0, 200, 0) if is_valid else (0, 0, 255)
-                    reason = (
-                        "Prescribed uniform verified"
-                        if is_valid
-                        else "Non-compliant attire: Missing or improper school uniform"
-                    )
+                    # ----------------------------------
+                    # CLASSIFICATION
+                    # ----------------------------------
 
-                    new_boxes.append((x1, y1, x2, y2, confidence, class_name, color))
+                    if class_name == "valid":
+
+                        is_valid = True
+                        display_name = "Valid"
+                        color = (0, 200, 0)
+
+                        reason = (
+                            "Prescribed clothing detected"
+                        )
+
+                    elif class_name == "invalid":
+
+                        is_valid = False
+                        display_name = "Invalid"
+                        color = (0, 0, 255)
+
+                        reason = (
+                            "Prohibited or non-compliant clothing detected"
+                        )
+
+                    else:
+
+                        is_valid = None
+                        display_name = "Unknown"
+                        color = (0, 165, 255)
+
+                        reason = (
+                            "Unrecognized clothing class"
+                        )
+
+                    # ----------------------------------
+                    # SAVE BOUNDING BOX
+                    # ----------------------------------
+
+                    new_boxes.append((
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        confidence,
+                        display_name,
+                        color
+                    ))
+
+                    # ----------------------------------
+                    # SAVE DETECTION DATA
+                    # ----------------------------------
+
                     detections.append({
-                        "box": [x1, y1, x2, y2],
+
+                        "box": [
+                            x1,
+                            y1,
+                            x2,
+                            y2
+                        ],
+
                         "class_id": class_id,
-                        "class_name": class_name,
-                        "confidence": round(confidence, 3),
+                        "class_name": display_name,
+
+                        "confidence": round(
+                            confidence, 3
+                        ),
+
                         "is_valid": is_valid,
                         "reason": reason,
+
                     })
 
+            # Update shared detection state
             with detection_lock:
+
                 cached_boxes = new_boxes
                 latest_people = detections
                 latest_count = len(detections)
                 camera_error = None
 
         except Exception as exc:
+
             with detection_lock:
                 camera_error = f"Detection error: {exc}"
+
             print("Detection error:", exc)
 
-        # High responsiveness with minimal CPU throttling
         time.sleep(0.03)
 
 
 # --------------------------------------------------
-# CAMERA WORKER (SMOOTH 30 FPS CAPTURE & STREAM)
+# CAMERA WORKER
 # --------------------------------------------------
 
 def camera_worker():
-    global latest_raw_frame, latest_frame, camera_error
+    global latest_raw_frame
+    global latest_frame
+    global camera_error
 
-    CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
-    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    camera_index = int(os.getenv("CAMERA_INDEX", "0"))
 
+    camera = cv2.VideoCapture(
+        camera_index,
+        cv2.CAP_DSHOW
+    )
+
+    # Try MSMF if DirectShow fails
     if not camera.isOpened():
         camera.release()
-        camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_MSMF)
+        camera = cv2.VideoCapture(
+            camera_index,
+            cv2.CAP_MSMF
+        )
 
-    if not camera.isOpened() and CAMERA_INDEX != 0:
+    # Try the alternate camera index if both backends fail
+    if not camera.isOpened():
         camera.release()
-        CAMERA_INDEX = 1
-        camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+
+        fallback_index = 1 if camera_index == 0 else 0
+
+        camera = cv2.VideoCapture(
+            fallback_index,
+            cv2.CAP_DSHOW
+        )
+
         if not camera.isOpened():
             camera.release()
-            camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_MSMF)
+            camera = cv2.VideoCapture(
+                fallback_index,
+                cv2.CAP_MSMF
+            )
 
+        if camera.isOpened():
+            camera_index = fallback_index
+
+    # Check camera availability
     if not camera.isOpened():
         camera.release()
+
         with detection_lock:
             camera_error = (
                 "Cannot open webcam. Check camera permissions "
                 "and ensure another app is not using it."
             )
+
+        print(camera_error)
         return
 
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    camera.set(cv2.CAP_PROP_FPS, 30)
+    # Test whether the camera actually sends frames
+    print("Camera successfully opened!")
 
-    print(f"Smooth webcam capture started on camera index {CAMERA_INDEX}.")
+    ret, test_frame = camera.read()
+
+    if ret and test_frame is not None:
+        print("Camera is sending frames!")
+        print("Frame size:", test_frame.shape)
+    else:
+        print("ERROR: Camera opened but no frames received!")
+
+    # Camera configuration
+    camera.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        640
+    )
+
+    camera.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        480
+    )
+
+    camera.set(
+        cv2.CAP_PROP_FPS,
+        30
+    )
+
+    print(
+        f"Webcam capture started on camera index {camera_index}."
+    )
 
     try:
+
         while running:
+
             ok, frame = camera.read()
 
             if not ok:
                 time.sleep(0.01)
                 continue
 
-            # Pass latest frame to detection worker
+            # Send latest frame to detection worker
             with raw_lock:
-                latest_raw_frame = frame
+                latest_raw_frame = frame.copy()
 
-            # Get current bounding boxes without blocking capture
+            # Get latest detections
             with detection_lock:
                 current_boxes = list(cached_boxes)
 
             # Draw detections
             display_frame = frame.copy()
-            for (x1, y1, x2, y2, confidence, class_name, color) in current_boxes:
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                label = f"{class_name.upper()} {confidence:.2f}"
+
+            for (
+                x1,
+                y1,
+                x2,
+                y2,
+                confidence,
+                class_name,
+                color
+            ) in current_boxes:
+
+                cv2.rectangle(
+                    display_frame,
+                    (x1, y1),
+                    (x2, y2),
+                    color,
+                    2
+                )
+
+                label = (
+                    f"{class_name.upper()} {confidence:.2f}"
+                )
+
                 cv2.putText(
                     display_frame,
                     label,
@@ -178,25 +335,30 @@ def camera_worker():
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     color,
-                    2,
+                    2
                 )
 
-            # Fast JPEG encode (quality 75 gives crisp visuals with small bandwidth & <2ms encode)
+            # Encode frame as JPEG
             ok, encoded = cv2.imencode(
                 ".jpg",
                 display_frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 75],
+                [
+                    cv2.IMWRITE_JPEG_QUALITY,
+                    75
+                ],
             )
 
             if ok:
+
                 with frame_lock:
                     latest_frame = encoded.tobytes()
 
-            # Slight yield to match ~30 FPS
             time.sleep(0.01)
 
     finally:
+
         camera.release()
+
         print("Webcam capture stopped.")
 
 
@@ -206,19 +368,29 @@ def camera_worker():
 
 @app.on_event("startup")
 def start_camera():
+
     global running
+
     running = True
 
-    # Start smooth camera capture thread
-    threading.Thread(target=camera_worker, daemon=True).start()
+    # Start camera thread
+    threading.Thread(
+        target=camera_worker,
+        daemon=True
+    ).start()
 
-    # Start decoupled inference worker thread
-    threading.Thread(target=detection_worker, daemon=True).start()
+    # Start YOLO detection thread
+    threading.Thread(
+        target=detection_worker,
+        daemon=True
+    ).start()
 
 
 @app.on_event("shutdown")
 def stop_camera():
+
     global running
+
     running = False
 
 
@@ -228,59 +400,151 @@ def stop_camera():
 
 @app.get("/")
 def home():
+
     return {
-        "message": "Smart Gate and Uniform Monitoring System is running",
+
+        "message": (
+            "Smart Gate and Uniform Monitoring System is running"
+        ),
+
         "model_classes": model.names,
-        "endpoints": ["/status", "/frame", "/beep"],
+
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+
+        "image_size": IMAGE_SIZE,
+
+        "endpoints": [
+            "/status",
+            "/frame",
+            "/beep",
+            "/docs"
+        ],
+
     }
 
 
+# --------------------------------------------------
+# DETECTION STATUS
+# --------------------------------------------------
+
 @app.get("/status")
 def status():
+
     with detection_lock:
-        people = list(latest_people)
+
+        detections = list(latest_people)
         count = latest_count
         err = camera_error
 
-    has_invalid = any(d.get("class_name", "").lower() == "invalid" for d in people)
-    has_valid = any(d.get("class_name", "").lower() == "valid" for d in people)
+    # Count valid and invalid clothing items
+    valid_count = sum(
+        1
+        for d in detections
+        if d["class_name"].lower() == "valid"
+    )
 
+    invalid_count = sum(
+        1
+        for d in detections
+        if d["class_name"].lower() == "invalid"
+    )
+
+    has_invalid = invalid_count > 0
+    has_valid = valid_count > 0
+
+    # ----------------------------------------------
+    # OVERALL COMPLIANCE STATUS
+    # ----------------------------------------------
+
+    if has_invalid:
+
+        compliance_status = "Non-Compliant"
+
+    elif has_valid:
+
+        # A Valid clothing detection alone cannot
+        # confirm that the complete outfit is compliant.
+        compliance_status = "Needs Review"
+
+    else:
+
+        compliance_status = "No Detection"
+        
+    # Check camera frame availability
     with frame_lock:
         ready = latest_frame is not None
 
     return {
+
         "count": count,
-        "people": people,
-        "detections": people,
+
+        "people": detections,
+        "detections": detections,
+
+        "valid_count": valid_count,
+        "invalid_count": invalid_count,
+
         "has_invalid": has_invalid,
         "has_valid": has_valid,
+
+        "compliance_status": compliance_status,
+
         "camera_error": err,
+
         "ready": ready,
+
     }
 
 
+# --------------------------------------------------
+# BEEP ALERT
+# --------------------------------------------------
+
 @app.post("/beep")
 def trigger_beep():
-    try:
-        threading.Thread(target=winsound.Beep, args=(1200, 250), daemon=True).start()
-        return {"status": "ok"}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
 
+    try:
+
+        threading.Thread(
+            target=winsound.Beep,
+            args=(1200, 250),
+            daemon=True
+        ).start()
+
+        return {
+            "status": "ok",
+            "message": "Alert beep triggered"
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+# --------------------------------------------------
+# LIVE CAMERA FRAME
+# --------------------------------------------------
 
 @app.get("/frame")
 def frame():
+
     with frame_lock:
         image = latest_frame
 
     if image is None:
+
         return Response(
             content=b"Camera frame not available yet",
-            status_code=503,
+            status_code=503
         )
 
     return Response(
         content=image,
         media_type="image/jpeg",
-        headers={"Cache-Control": "no-store"},
+        headers={
+            "Cache-Control": "no-store"
+        }
     )
